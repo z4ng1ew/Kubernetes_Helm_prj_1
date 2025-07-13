@@ -47,7 +47,7 @@ Secure Bookstore — онлайн-магазин книг, состоящий и
 
 ## Структура проекта
 
-```
+
 
 secure-bookstore/
 ├── charts/                   # Helm-чарты для приложения
@@ -72,7 +72,6 @@ secure-bookstore/
 ├── Dockerfile
 └── app.py
 
-```
 
 ---
 
