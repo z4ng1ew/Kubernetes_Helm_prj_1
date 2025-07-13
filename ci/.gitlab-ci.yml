@@ -1,0 +1,349 @@
+# GitLab CI/CD Pipeline for Secure Bookstore
+stages:
+  - build
+  - scan
+  - deploy
+
+variables:
+  # Docker registry settings
+  DOCKER_REGISTRY: $CI_REGISTRY
+  DOCKER_IMAGE_TAG: $CI_COMMIT_SHA
+  
+  # Application images
+  FRONTEND_IMAGE: "$CI_REGISTRY_IMAGE/frontend:$CI_COMMIT_SHA"
+  BACKEND_IMAGE: "$CI_REGISTRY_IMAGE/backend:$CI_COMMIT_SHA"
+  
+  # Kubernetes settings
+  KUBE_NAMESPACE_TEST: "bookstore-test"
+  KUBE_NAMESPACE_PROD: "bookstore-prod"
+  
+  # Helm settings
+  HELM_CHART_PATH: "charts/bookstore"
+  HELM_RELEASE_NAME: "bookstore"
+  
+  # Security scan settings
+  TRIVY_CACHE_DIR: ".trivycache/"
+
+# Use Docker-in-Docker for building images
+services:
+  - docker:24.0.7-dind
+
+before_script:
+  - echo $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER --password-stdin $CI_REGISTRY
+
+# ========================================
+# BUILD STAGE
+# ========================================
+
+build:frontend:
+  stage: build
+  image: docker:24.0.7
+  script:
+    - echo "Building frontend image..."
+    - cd frontend
+    - docker build -t $FRONTEND_IMAGE .
+    - docker push $FRONTEND_IMAGE
+    - echo "Frontend image pushed: $FRONTEND_IMAGE"
+  artifacts:
+    reports:
+      dotenv: frontend.env
+  only:
+    changes:
+      - frontend/**/*
+      - .gitlab-ci.yml
+  except:
+    - tags
+
+build:backend:
+  stage: build
+  image: docker:24.0.7
+  script:
+    - echo "Building backend image..."
+    - cd backend
+    - docker build -t $BACKEND_IMAGE .
+    - docker push $BACKEND_IMAGE
+    - echo "Backend image pushed: $BACKEND_IMAGE"
+  artifacts:
+    reports:
+      dotenv: backend.env
+  only:
+    changes:
+      - backend/**/*
+      - .gitlab-ci.yml
+  except:
+    - tags
+
+# Build both images when helm charts change
+build:all:
+  stage: build
+  image: docker:24.0.7
+  script:
+    - echo "Building all images..."
+    # Build frontend
+    - cd frontend
+    - docker build -t $FRONTEND_IMAGE .
+    - docker push $FRONTEND_IMAGE
+    - cd ..
+    # Build backend
+    - cd backend
+    - docker build -t $BACKEND_IMAGE .
+    - docker push $BACKEND_IMAGE
+    - echo "All images built and pushed"
+  only:
+    changes:
+      - charts/**/*
+      - ci/**/*
+  except:
+    - tags
+
+# ========================================
+# SECURITY SCAN STAGE
+# ========================================
+
+scan:frontend:
+  stage: scan
+  image: docker:24.0.7
+  cache:
+    paths:
+      - $TRIVY_CACHE_DIR
+  script:
+    - echo "Scanning frontend image for vulnerabilities..."
+    - chmod +x ci/trivy-scan.sh
+    - ./ci/trivy-scan.sh $FRONTEND_IMAGE frontend
+  artifacts:
+    reports:
+      junit: frontend-scan-results.xml
+    paths:
+      - frontend-scan-results.json
+      - frontend-scan-results.xml
+    expire_in: 1 week
+  dependencies:
+    - build:frontend
+  only:
+    changes:
+      - frontend/**/*
+      - ci/**/*
+      - .gitlab-ci.yml
+  allow_failure: false
+
+scan:backend:
+  stage: scan
+  image: docker:24.0.7
+  cache:
+    paths:
+      - $TRIVY_CACHE_DIR
+  script:
+    - echo "Scanning backend image for vulnerabilities..."
+    - chmod +x ci/trivy-scan.sh
+    - ./ci/trivy-scan.sh $BACKEND_IMAGE backend
+  artifacts:
+    reports:
+      junit: backend-scan-results.xml
+    paths:
+      - backend-scan-results.json
+      - backend-scan-results.xml
+    expire_in: 1 week
+  dependencies:
+    - build:backend
+  only:
+    changes:
+      - backend/**/*
+      - ci/**/*
+      - .gitlab-ci.yml
+  allow_failure: false
+
+# Scan all images when helm charts change
+scan:all:
+  stage: scan
+  image: docker:24.0.7
+  cache:
+    paths:
+      - $TRIVY_CACHE_DIR
+  script:
+    - echo "Scanning all images for vulnerabilities..."
+    - chmod +x ci/trivy-scan.sh
+    - ./ci/trivy-scan.sh $FRONTEND_IMAGE frontend
+    - ./ci/trivy-scan.sh $BACKEND_IMAGE backend
+  artifacts:
+    reports:
+      junit: 
+        - frontend-scan-results.xml
+        - backend-scan-results.xml
+    paths:
+      - "*-scan-results.json"
+      - "*-scan-results.xml"
+    expire_in: 1 week
+  dependencies:
+    - build:all
+  only:
+    changes:
+      - charts/**/*
+  allow_failure: false
+
+# ========================================
+# DEPLOY STAGE
+# ========================================
+
+deploy:test:
+  stage: deploy
+  image: 
+    name: alpine/helm:3.14.0
+    entrypoint: [""]
+  environment:
+    name: test
+    url: https://bookstore-test.example.com
+  before_script:
+    - apk add --no-cache curl kubectl
+    - kubectl config use-context $KUBE_CONTEXT_TEST
+    - helm repo add bitnami https://charts.bitnami.com/bitnami
+    - helm repo update
+  script:
+    - echo "Deploying to test environment..."
+    - kubectl create namespace $KUBE_NAMESPACE_TEST --dry-run=client -o yaml | kubectl apply -f -
+    
+    # Create image pull secret
+    - kubectl create secret docker-registry gitlab-registry 
+      --docker-server=$CI_REGISTRY 
+      --docker-username=$CI_REGISTRY_USER 
+      --docker-password=$CI_REGISTRY_PASSWORD 
+      --namespace=$KUBE_NAMESPACE_TEST 
+      --dry-run=client -o yaml | kubectl apply -f -
+    
+    # Deploy with Helm
+    - helm upgrade --install $HELM_RELEASE_NAME $HELM_CHART_PATH
+      --namespace $KUBE_NAMESPACE_TEST
+      --set frontend.image.repository=$CI_REGISTRY_IMAGE/frontend
+      --set frontend.image.tag=$CI_COMMIT_SHA
+      --set backend.image.repository=$CI_REGISTRY_IMAGE/backend
+      --set backend.image.tag=$CI_COMMIT_SHA
+      --set global.imagePullSecrets[0].name=gitlab-registry
+      --set ingress.hosts[0].host=bookstore-test.example.com
+      --set ingress.tls[0].hosts[0]=bookstore-test.example.com
+      --wait --timeout=10m
+    
+    # Verify deployment
+    - kubectl get pods -n $KUBE_NAMESPACE_TEST
+    - kubectl get services -n $KUBE_NAMESPACE_TEST
+    - kubectl get ingress -n $KUBE_NAMESPACE_TEST
+  
+  dependencies:
+    - scan:frontend
+    - scan:backend
+  only:
+    - develop
+    - main
+  except:
+    - tags
+
+deploy:staging:
+  stage: deploy
+  image: 
+    name: alpine/helm:3.14.0
+    entrypoint: [""]
+  environment:
+    name: staging
+    url: https://bookstore-staging.example.com
+  before_script:
+    - apk add --no-cache curl kubectl
+    - kubectl config use-context $KUBE_CONTEXT_STAGING
+    - helm repo add bitnami https://charts.bitnami.com/bitnami
+    - helm repo update
+  script:
+    - echo "Deploying to staging environment..."
+    - kubectl create namespace bookstore-staging --dry-run=client -o yaml | kubectl apply -f -
+    
+    # Deploy with Helm
+    - helm upgrade --install $HELM_RELEASE_NAME $HELM_CHART_PATH
+      --namespace bookstore-staging
+      --set frontend.image.repository=$CI_REGISTRY_IMAGE/frontend
+      --set frontend.image.tag=$CI_COMMIT_SHA
+      --set backend.image.repository=$CI_REGISTRY_IMAGE/backend
+      --set backend.image.tag=$CI_COMMIT_SHA
+      --set global.imagePullSecrets[0].name=gitlab-registry
+      --set ingress.hosts[0].host=bookstore-staging.example.com
+      --set ingress.tls[0].hosts[0]=bookstore-staging.example.com
+      --set autoscaling.enabled=true
+      --set autoscaling.minReplicas=2
+      --set autoscaling.maxReplicas=5
+      --wait --timeout=15m
+  
+  dependencies:
+    - scan:frontend
+    - scan:backend
+  only:
+    - main
+  when: manual
+
+deploy:production:
+  stage: deploy
+  image: 
+    name: alpine/helm:3.14.0
+    entrypoint: [""]
+  environment:
+    name: production
+    url: https://bookstore.example.com
+  before_script:
+    - apk add --no-cache curl kubectl
+    - kubectl config use-context $KUBE_CONTEXT_PROD
+    - helm repo add bitnami https://charts.bitnami.com/bitnami
+    - helm repo update
+  script:
+    - echo "Deploying to production environment..."
+    - kubectl create namespace $KUBE_NAMESPACE_PROD --dry-run=client -o yaml | kubectl apply -f -
+    
+    # Deploy with Helm (production settings)
+    - helm upgrade --install $HELM_RELEASE_NAME $HELM_CHART_PATH
+      --namespace $KUBE_NAMESPACE_PROD
+      --set frontend.image.repository=$CI_REGISTRY_IMAGE/frontend
+      --set frontend.image.tag=$CI_COMMIT_SHA
+      --set backend.image.repository=$CI_REGISTRY_IMAGE/backend
+      --set backend.image.tag=$CI_COMMIT_SHA
+      --set global.imagePullSecrets[0].name=gitlab-registry
+      --set ingress.hosts[0].host=bookstore.example.com
+      --set ingress.tls[0].hosts[0]=bookstore.example.com
+      --set frontend.replicaCount=3
+      --set backend.replicaCount=5
+      --set autoscaling.enabled=true
+      --set autoscaling.minReplicas=3
+      --set autoscaling.maxReplicas=10
+      --set backend.resources.limits.cpu=2000m
+      --set backend.resources.limits.memory=2Gi
+      --set backend.resources.requests.cpu=500m
+      --set backend.resources.requests.memory=512Mi
+      --wait --timeout=20m
+    
+    # Post-deployment verification
+    - kubectl get pods -n $KUBE_NAMESPACE_PROD
+    - kubectl get services -n $KUBE_NAMESPACE_PROD
+    - kubectl get ingress -n $KUBE_NAMESPACE_PROD
+    - echo "Production deployment completed successfully"
+  
+  dependencies:
+    - scan:frontend
+    - scan:backend
+  only:
+    - tags
+    - main
+  when: manual
+
+# ========================================
+# CLEANUP JOBS
+# ========================================
+
+cleanup:test:
+  stage: deploy
+  image: 
+    name: alpine/helm:3.14.0
+    entrypoint: [""]
+  before_script:
+    - apk add --no-cache kubectl
+    - kubectl config use-context $KUBE_CONTEXT_TEST
+  script:
+    - echo "Cleaning up test environment..."
+    - helm uninstall $HELM_RELEASE_NAME --namespace $KUBE_NAMESPACE_TEST || true
+    - kubectl delete namespace $KUBE_NAMESPACE_TEST --ignore-not-found=true
+    - echo "Test environment cleaned up"
+  when: manual
+  only:
+    - develop
+    - main
